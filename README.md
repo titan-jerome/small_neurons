@@ -29,11 +29,16 @@ Pain Dataset* — by:
 ```bash
 pip install -r requirements.txt
 
-# 1. Download ds005284 from OpenNeuro (public S3 bucket, no credentials needed).
-#    Full dataset is ~tens of GB; use --subjects to grab just a couple for testing.
+# 1. Check how subjects are actually labelled in this dataset (BIDS labels
+#    aren't guaranteed to be zero-padded numbers -- don't guess "01").
+python download_dataset.py --list-subjects
+
+# 2. Download ds005284 from OpenNeuro (public S3 bucket, no credentials needed).
+#    Full dataset is ~tens of GB; use --subjects with labels from step 1 to
+#    grab just a couple for testing.
 python download_dataset.py --target-dir ./ds005284 --subjects 01 02
 
-# 2. Run the analysis against the downloaded BIDS root:
+# 3. Run the analysis against the downloaded BIDS root:
 python compressibility_hypothesis.py --bids-root ./ds005284
 
 # Options:
