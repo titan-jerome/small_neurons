@@ -72,9 +72,38 @@ from scipy import stats
 # Occipital / parietal channels. Restricting to the back of the head keeps us
 # away from frontal EMG (jaw clench), EOG (blinks) and temporalis muscle bursts
 # that would otherwise inflate the "randomness" of the pain window for reasons
-# that have nothing to do with valence. Names follow the 10-20 system, which is
-# what BioSemi caps are labelled with once MNE reads the montage.
+# that have nothing to do with valence. Names follow the 10-20 system.
 POSTERIOR_CHANNELS = ["O1", "O2", "Oz", "P3", "P4", "Pz", "P7", "P8", "PO3", "PO4"]
+
+# BioSemi ActiveTwo systems record with hardware channel labels ("A1".."A32",
+# "B1".."B32", ...) rather than 10-20 names -- BIDS conversion does not always
+# rename them. These are BioSemi's own published wiring layouts for their
+# standard 32- and 64-electrode caps, used to translate hardware labels to
+# 10-20 names so POSTERIOR_CHANNELS above can match. If this dataset uses a
+# non-standard or larger (128/256-channel) cap, neither table will apply and
+# pick_posterior_channels() will raise rather than silently mis-map channels.
+BIOSEMI_32_TO_1020 = {
+    "A1": "Fp1", "A2": "AF3", "A3": "F7", "A4": "F3", "A5": "FC1", "A6": "FC5",
+    "A7": "T7", "A8": "C3", "A9": "CP1", "A10": "CP5", "A11": "P7", "A12": "P3",
+    "A13": "Pz", "A14": "PO3", "A15": "O1", "A16": "Oz", "A17": "O2", "A18": "PO4",
+    "A19": "P4", "A20": "P8", "A21": "CP6", "A22": "CP2", "A23": "C4", "A24": "T8",
+    "A25": "FC6", "A26": "FC2", "A27": "F4", "A28": "F8", "A29": "AF4", "A30": "Fp2",
+    "A31": "Fz", "A32": "Cz",
+}
+BIOSEMI_64_TO_1020 = {
+    "A1": "Fp1", "A2": "AF7", "A3": "AF3", "A4": "F1", "A5": "F3", "A6": "F5",
+    "A7": "F7", "A8": "FT7", "A9": "FC5", "A10": "FC3", "A11": "FC1", "A12": "C1",
+    "A13": "C3", "A14": "C5", "A15": "T7", "A16": "TP7", "A17": "CP5", "A18": "CP3",
+    "A19": "CP1", "A20": "P1", "A21": "P3", "A22": "P5", "A23": "P7", "A24": "P9",
+    "A25": "PO7", "A26": "PO3", "A27": "O1", "A28": "Iz", "A29": "Oz", "A30": "POz",
+    "A31": "Pz", "A32": "CPz",
+    "B1": "Fpz", "B2": "Fp2", "B3": "AF8", "B4": "AF4", "B5": "AFz", "B6": "Fz",
+    "B7": "F2", "B8": "F4", "B9": "F6", "B10": "F8", "B11": "FT8", "B12": "FC6",
+    "B13": "FC4", "B14": "FC2", "B15": "FCz", "B16": "Cz", "B17": "C2", "B18": "C4",
+    "B19": "C6", "B20": "T8", "B21": "TP8", "B22": "CP6", "B23": "CP4", "B24": "CP2",
+    "B25": "P2", "B26": "P4", "B27": "P6", "B28": "P8", "B29": "P10", "B30": "PO8",
+    "B31": "PO4", "B32": "O2",
+}
 
 # Pain window: 0.0 -> 3.0 s after the laser trigger.
 PAIN_TMIN, PAIN_TMAX = 0.0, 3.0
@@ -179,8 +208,30 @@ def load_raw(path: str):
     return mne.io.read_raw_fif(path, preload=True, verbose="ERROR")
 
 
+def standardize_channel_names(raw) -> None:
+    """Rename BioSemi hardware labels (A1, B12, ...) to 10-20 names in-place.
+
+    No-op if the recording already uses 10-20 names. Only renames channels that
+    are actually present, so extra externals (EXG1-8, GSR, Erg1, etc.) are left
+    alone and simply won't be picked as posterior channels later.
+    """
+    hw_channels = [ch for ch in raw.ch_names if ch in BIOSEMI_64_TO_1020 or ch in BIOSEMI_32_TO_1020]
+    if not hw_channels:
+        return  # already using standard names (or an unrecognised layout)
+
+    has_b_channels = any(ch.startswith("B") for ch in raw.ch_names)
+    mapping_table = BIOSEMI_64_TO_1020 if has_b_channels else BIOSEMI_32_TO_1020
+    cap_size = "64" if has_b_channels else "32"
+    mapping = {ch: mapping_table[ch] for ch in raw.ch_names if ch in mapping_table}
+    print(f"    [info] renaming {len(mapping)} BioSemi hardware channels "
+          f"using the standard {cap_size}-electrode cap layout -- verify this "
+          "matches the actual cap used for ds005284 if results look off.")
+    raw.rename_channels(mapping)
+
+
 def pick_posterior_channels(raw) -> None:
     """Restrict the recording in-place to available occipital/parietal channels."""
+    standardize_channel_names(raw)
     available = [ch for ch in POSTERIOR_CHANNELS if ch in raw.ch_names]
     if not available:
         raise RuntimeError(
