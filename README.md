@@ -29,6 +29,12 @@ Pain Dataset* — by:
 6. Aggregating per subject and running a one-sided paired t-test
    (`scipy.stats.ttest_rel`) for `ratio(baseline) < ratio(pain)`.
 
+The run produces a self-contained **Markdown report** (default
+`compressibility_report.md`) rather than raw terminal output — it documents the
+assumptions, the preprocessing pipeline, per-recording provenance (channels,
+selected event, trial/sample counts, anything skipped), the per-subject
+compression ratios, and the paired t-test with a verdict and power warning.
+
 ## Usage
 
 ```bash
@@ -51,6 +57,8 @@ python compressibility_hypothesis.py --bids-root ./ds005284
 #   --trial-type S  events.tsv value/trial_type string for the laser stimulus
 #                   (default: "condition 54", the 16 laser trials in ds005284)
 #   --stim-code N   trigger code, only if it comes from a hardware stim channel
+#   --report PATH   where to write the Markdown report (default:
+#                   compressibility_report.md)
 #   --limit N       process only the first N recordings (quick test)
 ```
 

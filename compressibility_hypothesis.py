@@ -38,9 +38,18 @@ Caveats (read before believing any p-value this prints)
   burst of spurious triggers at recording onset in some subjects and is excluded.
   This is the ``--trial-type`` default; override it for other datasets.
 
+Output
+------
+Instead of dumping to the terminal, the script writes a self-contained Markdown
+report (default: ``compressibility_report.md``, override with ``--report``)
+covering the assumptions, the preprocessing pipeline, per-recording provenance
+(channels, events, trials), the per-subject compression ratios, and the paired
+t-test with a verdict. The terminal only shows brief progress + the report path.
+
 Usage
 -----
     python compressibility_hypothesis.py --bids-root /path/to/ds005284
+    python compressibility_hypothesis.py --bids-root ./ds005284 --report run1.md
 
 This dataset stores triggers in BIDS ``*_events.tsv`` sidecars rather than a
 raw stim channel, so ``mne-bids`` is required (not optional) to read them.
@@ -275,30 +284,32 @@ def load_raw(path: str, bids_root: str):
     return mne.io.read_raw_fif(path, preload=True, verbose="ERROR")
 
 
-def standardize_channel_names(raw) -> None:
+def standardize_channel_names(raw) -> str:
     """Rename BioSemi hardware labels (A1, B12, ...) to 10-20 names in-place.
 
     No-op if the recording already uses 10-20 names. Only renames channels that
     are actually present, so extra externals (EXG1-8, GSR, Erg1, etc.) are left
-    alone and simply won't be picked as posterior channels later.
+    alone and simply won't be picked as posterior channels later. Returns a
+    short human-readable description of what was done, for the report.
     """
     hw_channels = [ch for ch in raw.ch_names if ch in BIOSEMI_64_TO_1020 or ch in BIOSEMI_32_TO_1020]
     if not hw_channels:
-        return  # already using standard names (or an unrecognised layout)
+        return "none (already 10-20 names)"
 
     has_b_channels = any(ch.startswith("B") for ch in raw.ch_names)
     mapping_table = BIOSEMI_64_TO_1020 if has_b_channels else BIOSEMI_32_TO_1020
     cap_size = "64" if has_b_channels else "32"
     mapping = {ch: mapping_table[ch] for ch in raw.ch_names if ch in mapping_table}
-    print(f"    [info] renaming {len(mapping)} BioSemi hardware channels "
-          f"using the standard {cap_size}-electrode cap layout -- verify this "
-          "matches the actual cap used for ds005284 if results look off.")
     raw.rename_channels(mapping)
+    return f"{len(mapping)} channels via standard BioSemi {cap_size}-electrode layout"
 
 
-def pick_posterior_channels(raw) -> None:
-    """Restrict the recording in-place to available occipital/parietal channels."""
-    standardize_channel_names(raw)
+def pick_posterior_channels(raw) -> tuple[list[str], str]:
+    """Restrict the recording in-place to available occipital/parietal channels.
+
+    Returns (channels_kept, cap_mapping_description).
+    """
+    cap_mapping = standardize_channel_names(raw)
     available = [ch for ch in POSTERIOR_CHANNELS if ch in raw.ch_names]
     if not available:
         raise RuntimeError(
@@ -306,6 +317,7 @@ def pick_posterior_channels(raw) -> None:
             f"{POSTERIOR_CHANNELS} were found. Channels present: {raw.ch_names[:20]}..."
         )
     raw.pick(available)
+    return available, cap_mapping
 
 
 def get_events(raw, stim_code: int | None, trial_type: str | None):
@@ -320,10 +332,15 @@ def get_events(raw, stim_code: int | None, trial_type: str | None):
     ``trial_type`` is the dataset's known laser label (see DEFAULT_TRIAL_TYPE).
     If it is empty (auto-detect), we look for a description containing "laser",
     and failing that fall back to the single most frequent code so the script
-    still produces *something*, with a loud warning either way. Only events
-    matching the chosen label are epoched, so unrelated labels (e.g. the
-    "condition 64" artifact burst) are excluded.
+    still produces *something*. How the code was chosen (and any warning) is
+    recorded in the returned ``info`` dict for the report rather than printed.
+    Only events matching the chosen label are epoched, so unrelated labels
+    (e.g. the "condition 64" artifact burst) are excluded.
+
+    Returns ``(events, chosen_code_or_None, info)``.
     """
+    info: dict = {"available": {}, "method": None, "note": None,
+                  "chosen_label": None, "chosen_code": None}
     events = None
     # Path A: hardware stim channel (typical for .bdf).
     try:
@@ -339,11 +356,18 @@ def get_events(raw, stim_code: int | None, trial_type: str | None):
         except (ValueError, RuntimeError):
             events = np.empty((0, 3), dtype=int)
 
+    if event_id_map is not None:
+        # Record available labels (as plain str) with their trigger codes.
+        info["available"] = {str(desc): int(c) for desc, c in event_id_map.items()}
+
     if len(events) == 0:
-        return events, None
+        info["note"] = "no events found"
+        return events, None, info
 
     present_codes = np.unique(events[:, 2])
     chosen = stim_code if stim_code in present_codes else None
+    if chosen is not None:
+        info["method"] = "stim-code"
 
     if chosen is None and event_id_map is not None:
         # Treat an empty --trial-type as "auto-detect" (an empty substring would
@@ -353,29 +377,29 @@ def get_events(raw, stim_code: int | None, trial_type: str | None):
                        if desc == trial_type or trial_type.lower() in desc.lower()]
             if matches:
                 chosen = matches[0]
+                info["method"] = f"--trial-type {trial_type!r}"
             else:
-                print(f"    [warn] --trial-type {trial_type!r} not found in "
-                      f"event descriptions: {list(event_id_map)}")
+                info["note"] = (f"--trial-type {trial_type!r} not found in "
+                                f"{list(info['available'])}")
         if chosen is None:
             laser_matches = [c for desc, c in event_id_map.items()
                               if "laser" in desc.lower()]
             if laser_matches:
                 chosen = laser_matches[0]
+                info["method"] = "auto-detect ('laser' in label)"
 
     if chosen is None:
         # Last resort: the single most frequent code, whatever it is.
         codes, counts = np.unique(events[:, 2], return_counts=True)
         chosen = int(codes[np.argmax(counts)])
-        desc = ""
-        if event_id_map is not None:
-            inv = {v: k for k, v in event_id_map.items()}
-            desc = f" ({inv.get(chosen, '?')!r})"
-        print(f"    [warn] no --stim-code/--trial-type match; using most "
-              f"frequent code {chosen}{desc}.")
-        if event_id_map is not None:
-            print(f"    [info] available trial types: {event_id_map}")
+        info["method"] = "fallback: most frequent code"
+        info["note"] = (info["note"] + "; " if info["note"] else "") + \
+            "no --stim-code/--trial-type match -- used most frequent code"
 
-    return events, chosen
+    inv = {c: str(desc) for desc, c in (event_id_map or {}).items()}
+    info["chosen_code"] = int(chosen)
+    info["chosen_label"] = inv.get(chosen, str(chosen))
+    return events, chosen, info
 
 
 # ---------------------------------------------------------------------------
@@ -384,7 +408,22 @@ def get_events(raw, stim_code: int | None, trial_type: str | None):
 
 @dataclass
 class SubjectResult:
+    """Everything we learned about one recording, for both stats and the report."""
     subject: str
+    filename: str = ""
+    status: str = "ok"                 # "ok" | "skipped: ..." | "error: ..."
+    sfreq: float = float("nan")
+    channels_used: list[str] = field(default_factory=list)
+    cap_mapping: str = ""
+    event_label: str = ""
+    event_code: int | None = None
+    event_method: str = ""
+    available_events: dict[str, int] = field(default_factory=dict)
+    n_stim_events: int = 0             # events matching the chosen label
+    n_other_events: int = 0            # events with other labels (excluded)
+    n_trials: int = 0                  # trials actually compressed
+    n_samples: int = 0                 # samples per window
+    window_sec: float = float("nan")
     pain: dict[str, list[float]] = field(default_factory=lambda: {"gzip": [], "bz2": []})
     base: dict[str, list[float]] = field(default_factory=lambda: {"gzip": [], "bz2": []})
 
@@ -398,21 +437,35 @@ class SubjectResult:
         vals = (self.pain if condition == "pain" else self.base)[algo]
         return float(np.mean(vals)) if vals else float("nan")
 
+    @property
+    def usable(self) -> bool:
+        return bool(self.pain["gzip"]) and bool(self.base["gzip"])
+
 
 def process_subject(sub: str, path: str, bids_root: str, stim_code: int | None,
-                     trial_type: str | None) -> SubjectResult | None:
-    """Compute mean pain vs baseline compression ratios for one subject."""
-    result = SubjectResult(subject=sub)
-    print(f"[{sub}] loading {os.path.basename(path)}")
+                    trial_type: str | None) -> SubjectResult:
+    """Compute mean pain vs baseline compression ratios for one subject.
+
+    Always returns a SubjectResult; on skip/error the ``status`` field explains
+    why and the ratio lists stay empty (so it is documented in the report rather
+    than silently dropped).
+    """
+    result = SubjectResult(subject=sub, filename=os.path.basename(path))
+    print(f"[{sub}] processing {result.filename} ...")
     raw = load_raw(path, bids_root)
-    pick_posterior_channels(raw)
+    result.channels_used, result.cap_mapping = pick_posterior_channels(raw)
 
-    events, code = get_events(raw, stim_code, trial_type)
+    events, code, info = get_events(raw, stim_code, trial_type)
+    result.available_events = info["available"]
+    result.event_method = info["method"] or ""
     if code is None:
-        print(f"    [warn] no events found for {sub}; skipping.")
-        return None
-
-    sfreq = raw.info["sfreq"]
+        result.status = f"skipped: {info.get('note') or 'no usable events'}"
+        return result
+    result.event_label = info["chosen_label"]
+    result.event_code = code
+    result.n_stim_events = int(np.sum(events[:, 2] == code))
+    result.n_other_events = int(len(events) - result.n_stim_events)
+    result.sfreq = float(raw.info["sfreq"])
 
     # Build epochs for the pain window (0 -> 3 s) and the baseline window
     # (-4 -> -1 s) from the *same* trigger. baseline=None so MNE does not
@@ -429,21 +482,219 @@ def process_subject(sub: str, path: str, bids_root: str, stim_code: int | None,
     # byte strings are strictly comparable.
     n_pain = pain_epochs.get_data(copy=False).shape[-1]
     n_base = base_epochs.get_data(copy=False).shape[-1]
-    n_samples = min(n_pain, n_base)
-    print(f"    fs={sfreq:.0f} Hz, {len(pain_epochs)} trials, "
-          f"{n_samples} samples/window ({n_samples / sfreq:.3f} s)")
+    result.n_samples = min(n_pain, n_base)
+    result.window_sec = result.n_samples / result.sfreq
 
-    pain_data = pain_epochs.get_data(copy=True)[..., :n_samples]  # (trials, ch, time)
-    base_data = base_epochs.get_data(copy=True)[..., :n_samples]
+    pain_data = pain_epochs.get_data(copy=True)[..., :result.n_samples]  # (trials, ch, time)
+    base_data = base_epochs.get_data(copy=True)[..., :result.n_samples]
 
     # Some trials may be dropped by one condition (e.g. window runs off the end of
     # the recording). Align on the trials kept by *both* conditions.
-    n_trials = min(pain_data.shape[0], base_data.shape[0])
-    for i in range(n_trials):
+    result.n_trials = min(pain_data.shape[0], base_data.shape[0])
+    for i in range(result.n_trials):
         result.add("pain", compression_ratios(matrix_to_bytes(pain_data[i])))
         result.add("base", compression_ratios(matrix_to_bytes(base_data[i])))
 
+    if not result.usable:
+        result.status = "skipped: no trials survived epoching"
+    print(f"    {result.status}"
+          + (f" | fs={result.sfreq:.0f} Hz, {result.n_trials} trials, "
+             f"{result.n_samples} samples/window" if result.usable else ""))
     return result
+
+
+# ---------------------------------------------------------------------------
+# Report generation
+# ---------------------------------------------------------------------------
+
+def _fmt(x: float, nd: int = 4) -> str:
+    return "n/a" if x is None or (isinstance(x, float) and np.isnan(x)) else f"{x:.{nd}f}"
+
+
+def paired_test(results: list[SubjectResult], algo: str) -> dict:
+    """One-sided paired t-test (baseline < pain) on per-subject mean ratios."""
+    pain = np.array([r.mean("pain", algo) for r in results])
+    base = np.array([r.mean("base", algo) for r in results])
+    out = {"algo": algo, "n": len(results),
+           "mean_pain": float(pain.mean()), "mean_base": float(base.mean()),
+           "t": float("nan"), "p_one": float("nan"), "supported": False}
+    if len(results) >= 2:
+        t_stat, p_two = stats.ttest_rel(base, pain)
+        p_one = p_two / 2 if t_stat < 0 else 1 - p_two / 2
+        out["t"], out["p_one"] = float(t_stat), float(p_one)
+        out["supported"] = bool(p_one < 0.05 and base.mean() < pain.mean())
+    return out
+
+
+def build_report(all_results: list[SubjectResult], config: dict) -> str:
+    """Render the full run -- assumptions, preprocessing, data, stats -- as Markdown."""
+    usable = [r for r in all_results if r.usable]
+    skipped = [r for r in all_results if not r.usable]
+    L: list[str] = []
+
+    L.append("# Algorithmic Compressibility of Pain vs. Baseline EEG")
+    L.append("")
+    L.append(f"*Generated {config['timestamp']}*")
+    L.append("")
+    L.append("Test of the **algorithmic compressibility** corollary of the Symmetry "
+             "Theory of Valence: negative-valence states (acute laser pain) are "
+             "predicted to be **less compressible** (more algorithmically random) "
+             "than matched calm/baseline states. Operationalised by gzip/bz2 "
+             "compression of short posterior-EEG windows.")
+    L.append("")
+    L.append("**Directional hypothesis (H1):** "
+             "`compression_ratio(baseline) < compression_ratio(pain)` "
+             "(baseline carries more redundancy). Lower ratio = more compressible.")
+    L.append("")
+
+    # ---- Assumptions & configuration --------------------------------------
+    L.append("## 1. Assumptions & configuration")
+    L.append("")
+    L.append("| Parameter | Value | Rationale |")
+    L.append("|---|---|---|")
+    L.append(f"| Dataset (BIDS root) | `{config['bids_root']}` | OpenNeuro ds005284 |")
+    L.append(f"| Posterior channels targeted | {', '.join(POSTERIOR_CHANNELS)} | "
+             "occipital/parietal only, to keep frontal EMG (jaw clench) & EOG "
+             "(blinks) out of the compression score |")
+    L.append(f"| Pain window | {PAIN_TMIN:.1f} to {PAIN_TMAX:.1f} s post-stimulus | "
+             "laser-evoked response |")
+    L.append(f"| Baseline window | {BASE_TMIN:.1f} to {BASE_TMAX:.1f} s | "
+             "matched-length rest, ending 1 s pre-stimulus to avoid anticipation |")
+    L.append(f"| Stimulus event | `{config['trial_type'] or 'auto-detect'}` | "
+             "the laser trials; other labels (e.g. the `condition 64` onset-glitch "
+             "burst) are excluded |")
+    L.append(f"| Serialisation | µV, {DECIMALS} decimals, space-separated ASCII | "
+             "fixed-precision text exposes signal redundancy identically across "
+             "platforms (see `matrix_to_bytes`) |")
+    L.append("| Compressors | gzip -9, bz2 -9 | general-purpose lossless |")
+    L.append("| Baseline correction | none | raw signal fed to compressor |")
+    L.append("| Artefact rejection | none | posterior-channel restriction is the "
+             "only artefact control |")
+    L.append("| Statistic | one-sided paired t-test (`scipy.stats.ttest_rel`) | "
+             "within-subject pain vs. baseline |")
+    L.append("")
+    L.append("**Key caveat:** compression ratio of raw float EEG is driven largely "
+             "by amplitude/variance and the byte encoding, *not* purely by "
+             "\"algorithmic symmetry\". Larger evoked potentials can look less "
+             "compressible for reasons unrelated to valence. Treat this as a "
+             "falsifiable toy probe, not a validation of STV.")
+    L.append("")
+    L.append("**Channel-mapping caveat:** BioSemi hardware labels (`A1`…`B32`) are "
+             "renamed to 10-20 names using the *standard* published cap layout; if "
+             "ds005284 used a non-standard montage the posterior selection could be "
+             "off. Confirm against `*_electrodes.tsv` if in doubt.")
+    L.append("")
+
+    # ---- Preprocessing pipeline -------------------------------------------
+    L.append("## 2. Preprocessing pipeline (per recording)")
+    L.append("")
+    L.append("1. **Load** raw `.bdf` via `mne_bids.read_raw_bids`, which attaches "
+             "the `*_events.tsv` sidecar as annotations.")
+    L.append("2. **Rename** BioSemi hardware channels to 10-20 names.")
+    L.append("3. **Pick** the posterior channels present.")
+    L.append("4. **Locate events** and select the laser-stimulus trigger.")
+    L.append("5. **Epoch** each trigger into the pain and baseline windows "
+             "(`baseline=None`, no rejection), cropped to identical sample counts.")
+    L.append("6. **Serialise** each (channels × time) window to bytes and record "
+             "gzip & bz2 compression ratios; average within subject.")
+    L.append("")
+
+    # ---- Per-subject provenance -------------------------------------------
+    L.append("## 3. Per-recording processing")
+    L.append("")
+    L.append(f"Recordings found: **{len(all_results)}** | usable: **{len(usable)}** "
+             f"| skipped: **{len(skipped)}**")
+    L.append("")
+    L.append("| Subject | File | fs (Hz) | Channels used | Cap mapping | "
+             "Stim event (code) | Selection | Stim/other events | Trials | "
+             "Samples/window |")
+    L.append("|---|---|---|---|---|---|---|---|---|---|")
+    for r in all_results:
+        chans = ", ".join(r.channels_used) if r.channels_used else "—"
+        label = (f"`{r.event_label}` ({r.event_code})"
+                 if r.event_code is not None else "—")
+        win = f"{r.n_samples} ({_fmt(r.window_sec, 3)} s)" if r.n_samples else "—"
+        L.append(f"| {r.subject} | `{r.filename}` | "
+                 f"{_fmt(r.sfreq, 0) if not np.isnan(r.sfreq) else '—'} | {chans} | "
+                 f"{r.cap_mapping or '—'} | {label} | {r.event_method or '—'} | "
+                 f"{r.n_stim_events}/{r.n_other_events} | {r.n_trials or '—'} | {win} |")
+    L.append("")
+    if skipped:
+        L.append("Skipped recordings:")
+        L.append("")
+        for r in skipped:
+            L.append(f"- **{r.subject}** — {r.status}"
+                     + (f" (available events: {r.available_events})"
+                        if r.available_events else ""))
+        L.append("")
+
+    # ---- Compression ratios ------------------------------------------------
+    L.append("## 4. Per-subject mean compression ratios")
+    L.append("")
+    L.append("Lower = more compressible (more redundancy). Each value is the mean "
+             "over that subject's trials.")
+    L.append("")
+    L.append("| Subject | Trials | gzip pain | gzip base | Δ (pain−base) | "
+             "bz2 pain | bz2 base | Δ (pain−base) |")
+    L.append("|---|---|---|---|---|---|---|---|")
+    for r in usable:
+        gp, gb = r.mean("pain", "gzip"), r.mean("base", "gzip")
+        bp, bb = r.mean("pain", "bz2"), r.mean("base", "bz2")
+        L.append(f"| {r.subject} | {r.n_trials} | {_fmt(gp)} | {_fmt(gb)} | "
+                 f"{_fmt(gp - gb)} | {_fmt(bp)} | {_fmt(bb)} | {_fmt(bp - bb)} |")
+    L.append("")
+    L.append("A **positive Δ** (pain − baseline > 0) means the pain window was "
+             "*less* compressible than baseline — the direction H1 predicts.")
+    L.append("")
+
+    # ---- Statistics --------------------------------------------------------
+    L.append("## 5. Statistical comparison")
+    L.append("")
+    if len(usable) < 2:
+        L.append(f"> **Only {len(usable)} usable subject(s)** — a paired t-test "
+                 "needs ≥2, and is meaningless below a handful. No test run.")
+        L.append("")
+    else:
+        L.append("Paired t-test on per-subject mean ratios, "
+                 "H1: baseline more compressible than pain.")
+        L.append("")
+        L.append("| Compressor | n | mean baseline | mean pain | t | one-sided p | "
+                 "Supports H1? |")
+        L.append("|---|---|---|---|---|---|---|")
+        verdicts = []
+        for algo in ("gzip", "bz2"):
+            s = paired_test(usable, algo)
+            verdicts.append(s)
+            L.append(f"| {algo} | {s['n']} | {_fmt(s['mean_base'])} | "
+                     f"{_fmt(s['mean_pain'])} | {_fmt(s['t'], 3)} | "
+                     f"{_fmt(s['p_one'], 4)} | "
+                     f"{'**yes** ✓' if s['supported'] else 'no'} |")
+        L.append("")
+        L.append("### Verdict")
+        L.append("")
+        if all(v["supported"] for v in verdicts):
+            L.append("Baseline windows were significantly **more compressible** than "
+                     "pain windows on both compressors — **consistent** with the "
+                     "algorithmic compressibility hypothesis in this sample.")
+        elif any(v["supported"] for v in verdicts):
+            L.append("Mixed: significant in the predicted direction on one compressor "
+                     "but not the other. Weak/ambiguous support.")
+        else:
+            L.append("No significant support for the hypothesis in this sample: "
+                     "baseline windows were **not** reliably more compressible than "
+                     "pain windows.")
+        L.append("")
+        n = len(usable)
+        if n < 10:
+            L.append(f"> ⚠️ With only **n = {n}** subjects this test has very low "
+                     "power; treat any p-value (significant or not) as indicative "
+                     "only. Run the full cohort before drawing conclusions.")
+            L.append("")
+
+    L.append("---")
+    L.append(f"*Command: `{config['argv']}`*")
+    L.append("")
+    return "\n".join(L)
 
 
 # ---------------------------------------------------------------------------
@@ -451,65 +702,40 @@ def process_subject(sub: str, path: str, bids_root: str, stim_code: int | None,
 # ---------------------------------------------------------------------------
 
 def run(bids_root: str, stim_code: int | None, trial_type: str | None,
-        limit: int | None) -> None:
+        limit: int | None, report_path: str) -> None:
+    import datetime
+
     files = find_subject_files(bids_root)
     if not files:
         sys.exit(f"No raw EEG files found under {bids_root!r}. "
                  "Expected a BIDS tree like sub-01/eeg/sub-01_task-*_eeg.bdf")
     if limit:
         files = files[:limit]
-    print(f"Found {len(files)} recording(s).\n")
+    print(f"Found {len(files)} recording(s); processing...\n")
 
-    results: list[SubjectResult] = []
+    all_results: list[SubjectResult] = []
     for sub, path in files:
         try:
             res = process_subject(sub, path, bids_root, stim_code, trial_type)
         except Exception as exc:  # keep going; one bad file shouldn't kill the run
-            print(f"    [error] {sub}: {exc}")
-            continue
-        if res is not None and res.pain["gzip"] and res.base["gzip"]:
-            results.append(res)
+            res = SubjectResult(subject=sub, filename=os.path.basename(path),
+                                status=f"error: {exc}")
+            print(f"    error: {exc}")
+        all_results.append(res)
 
-    if len(results) < 2:
-        sys.exit("\nNeed at least 2 usable subjects for a paired t-test.")
+    config = {
+        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "bids_root": bids_root,
+        "trial_type": trial_type,
+        "argv": " ".join(sys.argv),
+    }
+    report = build_report(all_results, config)
+    with open(report_path, "w", encoding="utf-8") as fh:
+        fh.write(report)
 
-    # Aggregate to one mean ratio per subject per condition, then compare.
-    print("\n" + "=" * 70)
-    print("Per-subject mean compression ratio (lower = more compressible)")
-    print("=" * 70)
-    print(f"{'subject':<12}{'gzip pain':>11}{'gzip base':>11}"
-          f"{'bz2 pain':>11}{'bz2 base':>11}")
-
-    summary = {algo: {"pain": [], "base": []} for algo in ("gzip", "bz2")}
-    for res in results:
-        row = [res.subject]
-        for algo in ("gzip", "bz2"):
-            mp, mb = res.mean("pain", algo), res.mean("base", algo)
-            summary[algo]["pain"].append(mp)
-            summary[algo]["base"].append(mb)
-        print(f"{res.subject:<12}"
-              f"{res.mean('pain', 'gzip'):>11.4f}{res.mean('base', 'gzip'):>11.4f}"
-              f"{res.mean('pain', 'bz2'):>11.4f}{res.mean('base', 'bz2'):>11.4f}")
-
-    print("\n" + "=" * 70)
-    print("Paired t-test: are BASELINE windows more compressible than PAIN?")
-    print("H1: ratio(baseline) < ratio(pain)   [baseline has more redundancy]")
-    print("=" * 70)
-    for algo in ("gzip", "bz2"):
-        pain = np.array(summary[algo]["pain"])
-        base = np.array(summary[algo]["base"])
-        # One-sided paired t-test (baseline < pain).
-        t_stat, p_two = stats.ttest_rel(base, pain)
-        # Convert the two-sided p to a one-sided p for the directional hypothesis.
-        p_one = p_two / 2 if t_stat < 0 else 1 - p_two / 2
-        print(f"\n[{algo}]  mean baseline={base.mean():.4f}  "
-              f"mean pain={pain.mean():.4f}  (n={len(pain)} subjects)")
-        print(f"        t = {t_stat:+.3f}   one-sided p = {p_one:.4g}")
-        if p_one < 0.05 and base.mean() < pain.mean():
-            print("        => Baseline significantly MORE compressible than pain "
-                  "(consistent with the hypothesis).")
-        else:
-            print("        => No significant support for the hypothesis in this data.")
+    usable = [r for r in all_results if r.usable]
+    print(f"\nDone: {len(usable)}/{len(all_results)} recordings usable.")
+    print(f"Report written to: {report_path}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -527,6 +753,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "artifact burst and is deliberately excluded). Pass a "
                         "different string for other datasets, or '' to auto-"
                         "detect (looks for 'laser', else the most frequent code).")
+    p.add_argument("--report", default="compressibility_report.md",
+                   help="Path for the Markdown report (default: "
+                        "compressibility_report.md).")
     p.add_argument("--limit", type=int, default=None,
                    help="Process only the first N recordings (for quick testing).")
     return p
@@ -534,4 +763,4 @@ def build_parser() -> argparse.ArgumentParser:
 
 if __name__ == "__main__":
     args = build_parser().parse_args()
-    run(args.bids_root, args.stim_code, args.trial_type, args.limit)
+    run(args.bids_root, args.stim_code, args.trial_type, args.limit, args.report)
