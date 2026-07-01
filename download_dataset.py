@@ -15,7 +15,11 @@ Usage
     # openneuro-py fail with "Could not find path in the dataset".
     python download_dataset.py --list-subjects
 
-    # Full dataset (26 subjects, likely tens of GB -- expect a long download):
+    # Full dataset (26 subjects, likely tens of GB -- expect a long download).
+    # By default this SKIPS derivatives/ (~3 GB of the authors' own
+    # preprocessed EEGLAB exports) since compressibility_hypothesis.py only
+    # reads the raw sub-*/eeg/*_eeg.bdf files. Pass --include-derivatives to
+    # get everything.
     python download_dataset.py --target-dir ./ds005284
 
     # Just a couple of subjects, using labels from --list-subjects above:
@@ -111,11 +115,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--list-subjects", action="store_true",
                    help="Print the dataset's actual subject labels and exit "
                         "(no download).")
+    p.add_argument("--include-derivatives", action="store_true",
+                   help="Also download derivatives/ (~3 GB of the authors' own "
+                        "preprocessed EEGLAB exports). Skipped by default since "
+                        "compressibility_hypothesis.py only needs the raw "
+                        "sub-*/eeg/*_eeg.bdf files.")
     return p
 
 
-def run(target_dir: str, subjects: list[str] | None, tag: str | None) -> None:
+def run(target_dir: str, subjects: list[str] | None, tag: str | None,
+        include_derivatives: bool) -> None:
     include = None
+    exclude = None if include_derivatives else ["derivatives/"]
     if subjects:
         # openneuro-py matches --include against exact path prefixes, so a
         # wrong guess (e.g. "01" when the real label is "1") fails loudly
@@ -136,11 +147,15 @@ def run(target_dir: str, subjects: list[str] | None, tag: str | None) -> None:
         print(f"Downloading FULL dataset {DATASET_ID} -> {target_dir} "
               "(this can be tens of GB and take a while)")
 
+    if exclude:
+        print(f"Skipping {exclude} (pass --include-derivatives to fetch it too).")
+
     openneuro.download(
         dataset=DATASET_ID,
         target_dir=target_dir,
         tag=tag,
         include=include,
+        exclude=exclude,
     )
     print(f"\nDone. Point the analysis script at it with:\n"
           f"    python compressibility_hypothesis.py --bids-root {target_dir}")
@@ -154,4 +169,4 @@ if __name__ == "__main__":
         for label in labels:
             print(f"  {label}  (--subjects {label})")
         sys.exit(0)
-    run(args.target_dir, args.subjects, args.tag)
+    run(args.target_dir, args.subjects, args.tag, args.include_derivatives)

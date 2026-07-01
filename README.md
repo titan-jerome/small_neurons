@@ -39,8 +39,9 @@ pip install -r requirements.txt
 python download_dataset.py --list-subjects
 
 # 2. Download ds005284 from OpenNeuro (public S3 bucket, no credentials needed).
-#    Full dataset is ~tens of GB; use --subjects with labels from step 1 to
-#    grab just a couple for testing.
+#    Full dataset (raw EEG only, derivatives/ skipped by default -- see below)
+#    is ~1.8 GB. Use --subjects with labels from step 1 to grab just a couple
+#    for testing.
 python download_dataset.py --target-dir ./ds005284 --subjects 01 02
 
 # 3. Run the analysis against the downloaded BIDS root:
@@ -66,6 +67,21 @@ Confirmed from the dataset's README and `*_events.tsv` sidecars:
 
 Because the script pins `condition 54` rather than guessing the most frequent
 code, the artifact burst can never be mistaken for the stimulus.
+
+### Dataset size: why the site says ~1.6 GB but a full download is bigger
+
+OpenNeuro's displayed dataset size only counts the raw `sub-*/eeg/*.bdf` files
+(~1.8 GB). The snapshot also ships a `derivatives/session_merged_data/` folder
+with ~3 GB of the original authors' preprocessed EEGLAB (`.set`/`.fdt`) exports,
+which isn't reflected in that headline number but *is* included in a full
+download. `compressibility_hypothesis.py` never reads `derivatives/`, so
+`download_dataset.py` excludes it by default -- pass `--include-derivatives` if
+you want it anyway. If you already downloaded before this default existed, just
+delete the folder:
+
+```bash
+rm -rf ds005284/derivatives
+```
 
 ## Important caveat
 
