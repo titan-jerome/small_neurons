@@ -33,10 +33,10 @@ Caveats (read before believing any p-value this prints)
   by the text/byte encoding, *not* purely by "algorithmic symmetry". A pain
   window with larger evoked potentials can look less compressible simply because
   it has more dynamic range. This is a toy probe, not a validation of STV.
-* Event trigger codes/descriptions differ per dataset; the value used here is a
-  best-effort guess (looks for a "laser" trial_type) and is overridable via
-  ``--trial-type``/``--stim-code``. Run once, read the "available trial types"
-  line it prints, and re-run with the correct flag before trusting results.
+* The laser stimulus in ds005284 is the "condition 54" event (16 trials/subject,
+  confirmed against the README and events.tsv sidecars). "condition 64" is a
+  burst of spurious triggers at recording onset in some subjects and is excluded.
+  This is the ``--trial-type`` default; override it for other datasets.
 
 Usage
 -----
@@ -114,6 +114,21 @@ BIOSEMI_64_TO_1020 = {
     "B25": "P2", "B26": "P4", "B27": "P6", "B28": "P8", "B29": "P10", "B30": "PO8",
     "B31": "PO4", "B32": "O2",
 }
+
+# Laser-stimulus event label for ds005284. The events.tsv files use a "value"
+# column (there is no "trial_type" column) whose entries MNE surfaces verbatim
+# as annotation descriptions. Inspecting the sidecars shows two distinct labels:
+#   * "condition 54" -- the 16 laser pain trials, spaced ~12-13 s apart, present
+#     identically in every subject. This matches the README ("16 trials,
+#     approximately every 20 seconds") and the task events.json ("Laser stimli").
+#   * "condition 64" -- NOT a stimulus: in sub-001 it is a burst of 14 triggers
+#     crammed into a ~200 ms window at t~=7.8 s (a recording-onset/status-channel
+#     glitch), ~2 min before the first real laser. It appears in only some
+#     subjects and must be excluded.
+# We therefore pin "condition 54" rather than trusting a "most frequent code"
+# heuristic, which would silently select the artifact burst in any subject where
+# it happened to contain more triggers than the 16 real trials.
+DEFAULT_TRIAL_TYPE = "condition 54"
 
 # Pain window: 0.0 -> 3.0 s after the laser trigger.
 PAIN_TMIN, PAIN_TMAX = 0.0, 3.0
@@ -301,11 +316,13 @@ def get_events(raw, stim_code: int | None, trial_type: str | None):
     ``mne_bids.read_raw_bids``. We try the hardware channel first, then fall
     back to annotations. Annotation descriptions come from the ``trial_type``/
     ``value`` column and are arbitrary strings, so ``--stim-code`` (an int)
-    cannot select them directly -- use ``--trial-type`` instead. If neither is
-    given, we look for a description containing "laser" (this is a laser-pain
-    paradigm, so the stimulus onset event is very likely labelled that way);
-    failing that, we fall back to the single most frequent code so the script
-    still produces *something*, with a loud warning either way.
+    cannot select them directly -- use ``--trial-type`` instead. By default
+    ``trial_type`` is the dataset's known laser label (see DEFAULT_TRIAL_TYPE).
+    If it is empty (auto-detect), we look for a description containing "laser",
+    and failing that fall back to the single most frequent code so the script
+    still produces *something*, with a loud warning either way. Only events
+    matching the chosen label are epoched, so unrelated labels (e.g. the
+    "condition 64" artifact burst) are excluded.
     """
     events = None
     # Path A: hardware stim channel (typical for .bdf).
@@ -329,7 +346,9 @@ def get_events(raw, stim_code: int | None, trial_type: str | None):
     chosen = stim_code if stim_code in present_codes else None
 
     if chosen is None and event_id_map is not None:
-        if trial_type is not None:
+        # Treat an empty --trial-type as "auto-detect" (an empty substring would
+        # otherwise match every description).
+        if trial_type:
             matches = [c for desc, c in event_id_map.items()
                        if desc == trial_type or trial_type.lower() in desc.lower()]
             if matches:
@@ -501,13 +520,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--stim-code", type=int, default=None,
                    help="Trigger code for the laser stimulus, if it comes from "
                         "a hardware stim channel rather than events.tsv.")
-    p.add_argument("--trial-type", default=None,
-                   help="events.tsv trial_type/value string identifying the "
-                        "laser stimulus onset (e.g. 'laser_high'). If omitted, "
-                        "the script looks for a description containing "
-                        "'laser', then falls back to the most frequent event. "
-                        "INSPECT YOUR EVENTS FIRST -- run once and read the "
-                        "'available trial types' output before trusting results.")
+    p.add_argument("--trial-type", default=DEFAULT_TRIAL_TYPE,
+                   help="events.tsv value/trial_type string identifying the "
+                        f"laser stimulus onset (default: {DEFAULT_TRIAL_TYPE!r}, "
+                        "the 16 laser trials in ds005284; 'condition 64' is an "
+                        "artifact burst and is deliberately excluded). Pass a "
+                        "different string for other datasets, or '' to auto-"
+                        "detect (looks for 'laser', else the most frequent code).")
     p.add_argument("--limit", type=int, default=None,
                    help="Process only the first N recordings (for quick testing).")
     return p

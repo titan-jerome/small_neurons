@@ -47,16 +47,25 @@ python download_dataset.py --target-dir ./ds005284 --subjects 01 02
 python compressibility_hypothesis.py --bids-root ./ds005284
 
 # Options:
-#   --trial-type S  events.tsv trial_type/value string for the laser stimulus
-#                   onset (default: looks for a description containing "laser")
+#   --trial-type S  events.tsv value/trial_type string for the laser stimulus
+#                   (default: "condition 54", the 16 laser trials in ds005284)
 #   --stim-code N   trigger code, only if it comes from a hardware stim channel
 #   --limit N       process only the first N recordings (quick test)
 ```
 
-The first run against real data will print an `[info] available trial types: {...}`
-line — check that the auto-picked description is actually the laser stimulus
-onset (not a rating prompt, rest marker, etc.) and pass `--trial-type` explicitly
-if not.
+### Which event is the laser stimulus?
+
+Confirmed from the dataset's README and `*_events.tsv` sidecars:
+
+* **`condition 54`** — the laser pain stimulus: 16 trials per subject spaced
+  ~12–13 s apart ("16 trials, approximately every 20 seconds"). This is the
+  default the script epochs on.
+* **`condition 64`** — *not* a stimulus. In sub-001 it's 14 triggers packed into
+  a ~200 ms burst at t≈7.8 s (a recording-onset glitch), ~2 minutes before the
+  first real laser. It appears in only some subjects and is deliberately excluded.
+
+Because the script pins `condition 54` rather than guessing the most frequent
+code, the artifact burst can never be mistaken for the stimulus.
 
 ## Important caveat
 
