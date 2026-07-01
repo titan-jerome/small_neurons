@@ -12,9 +12,14 @@ states, which should be *more compressible* (more redundant / symmetric).
 [`ds005284`](https://openneuro.org/datasets/ds005284) — *The 26 By Biosemi Laser
 Pain Dataset* — by:
 
-1. Loading the BIDS-formatted BioSemi `.bdf` raw files with MNE.
-2. Restricting to occipital/parietal channels (O1, O2, Oz, P3, P4, Pz, …) to keep
-   jaw-clench EMG and blink EOG artefacts out of the compression score.
+1. Loading the BIDS-formatted BioSemi `.bdf` raw files via `mne_bids.read_raw_bids`,
+   which attaches each `*_events.tsv` sidecar as annotations (a plain `read_raw_bdf`
+   call would silently see zero events, since the triggers live in that sidecar,
+   not in the raw file's own stim channel).
+2. Renaming BioSemi's raw hardware channel labels (`A1`…`A32`, `B1`…`B32`, …) to
+   10-20 names, then restricting to occipital/parietal channels (O1, O2, Oz, P3,
+   P4, Pz, …) to keep jaw-clench EMG and blink EOG artefacts out of the
+   compression score.
 3. Epoching each laser trigger into a **pain window** (0–3 s post-stimulus) and a
    matched **baseline window** (−4 to −1 s), cropped to identical sample counts.
 4. Serialising each (channels × time) matrix to a fixed-precision ASCII byte
@@ -42,9 +47,16 @@ python download_dataset.py --target-dir ./ds005284 --subjects 01 02
 python compressibility_hypothesis.py --bids-root ./ds005284
 
 # Options:
-#   --stim-code N   trigger code for the laser stimulus (inspect your events!)
+#   --trial-type S  events.tsv trial_type/value string for the laser stimulus
+#                   onset (default: looks for a description containing "laser")
+#   --stim-code N   trigger code, only if it comes from a hardware stim channel
 #   --limit N       process only the first N recordings (quick test)
 ```
+
+The first run against real data will print an `[info] available trial types: {...}`
+line — check that the auto-picked description is actually the laser stimulus
+onset (not a rating prompt, rest marker, etc.) and pass `--trial-type` explicitly
+if not.
 
 ## Important caveat
 

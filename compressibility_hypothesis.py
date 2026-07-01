@@ -33,15 +33,19 @@ Caveats (read before believing any p-value this prints)
   by the text/byte encoding, *not* purely by "algorithmic symmetry". A pain
   window with larger evoked potentials can look less compressible simply because
   it has more dynamic range. This is a toy probe, not a validation of STV.
-* Event trigger codes differ per dataset; the value used here is a best guess and
-  is exposed as a CLI flag. Always inspect ``raw.annotations`` / the events array
-  for your data before trusting the epoching.
+* Event trigger codes/descriptions differ per dataset; the value used here is a
+  best-effort guess (looks for a "laser" trial_type) and is overridable via
+  ``--trial-type``/``--stim-code``. Run once, read the "available trial types"
+  line it prints, and re-run with the correct flag before trusting results.
 
 Usage
 -----
     python compressibility_hypothesis.py --bids-root /path/to/ds005284
 
-Dependencies: mne, numpy, scipy (and optionally mne-bids). Install with:
+This dataset stores triggers in BIDS ``*_events.tsv`` sidecars rather than a
+raw stim channel, so ``mne-bids`` is required (not optional) to read them.
+
+Dependencies: mne, mne-bids, numpy, scipy. Install with:
     pip install mne mne-bids numpy scipy
 """
 
@@ -52,6 +56,7 @@ import bz2
 import glob
 import gzip
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 
@@ -61,6 +66,11 @@ try:
     import mne
 except ImportError:  # pragma: no cover - dependency hint
     sys.exit("This script requires MNE-Python. Install it with: pip install mne")
+
+try:
+    import mne_bids
+except ImportError:
+    mne_bids = None
 
 from scipy import stats
 
@@ -199,8 +209,50 @@ def find_subject_files(bids_root: str) -> list[tuple[str, str]]:
     return matches
 
 
-def load_raw(path: str):
-    """Read a single raw file with the appropriate MNE reader."""
+def _bids_entities(filename: str) -> dict:
+    """Parse BIDS entities (sub, ses, task, acq, run) out of a filename."""
+    base = os.path.basename(filename)
+    entities = {}
+    for key in ("sub", "ses", "task", "acq", "run"):
+        m = re.search(rf"{key}-([A-Za-z0-9]+)", base)
+        if m:
+            entities[key] = m.group(1)
+    return entities
+
+
+def load_raw(path: str, bids_root: str):
+    """Read a raw file, preferring MNE-BIDS so ``*_events.tsv`` is attached.
+
+    BIDS EEG datasets store trigger onsets/labels in a companion
+    ``*_events.tsv`` sidecar, not (necessarily) in the raw file's own stim
+    channel or annotations. Reading the ``.bdf``/``.edf`` directly with a plain
+    MNE reader silently skips that sidecar, which is why a naive
+    ``read_raw_bdf`` call can find zero events even though the dataset has
+    them. ``mne_bids.read_raw_bids`` reads ``events.tsv`` and converts each row
+    into an ``mne.Annotations`` entry (description = the ``trial_type``/
+    ``value`` column), so ``mne.events_from_annotations`` downstream then has
+    something to work with.
+    """
+    if mne_bids is not None and path.endswith((".bdf", ".edf")):
+        entities = _bids_entities(path)
+        if "sub" in entities and "task" in entities:
+            try:
+                bids_path = mne_bids.BIDSPath(
+                    subject=entities["sub"], session=entities.get("ses"),
+                    task=entities["task"], acquisition=entities.get("acq"),
+                    run=entities.get("run"), datatype="eeg", suffix="eeg",
+                    root=bids_root,
+                )
+                raw = mne_bids.read_raw_bids(
+                    bids_path, extra_params={"preload": True}, verbose="ERROR"
+                )
+                raw.load_data()
+                return raw
+            except Exception as exc:
+                print(f"    [warn] mne_bids read failed ({exc}); falling back "
+                      "to a plain reader (events.tsv annotations will NOT be "
+                      "attached).")
+
     if path.endswith(".bdf"):
         return mne.io.read_raw_bdf(path, preload=True, verbose="ERROR")
     if path.endswith(".edf"):
@@ -241,13 +293,19 @@ def pick_posterior_channels(raw) -> None:
     raw.pick(available)
 
 
-def get_events(raw, stim_code: int | None):
+def get_events(raw, stim_code: int | None, trial_type: str | None):
     """Extract an events array, from a stim channel or from annotations.
 
-    BioSemi files carry triggers on a ``Status`` stim channel; some BIDS exports
-    instead store them as annotations. We try both and, if the requested trigger
-    code is not present, fall back to the most frequent non-zero code so the
-    script still produces epochs (with a loud warning).
+    BioSemi files carry triggers on a ``Status`` stim channel; BIDS exports
+    (this dataset) instead attach ``events.tsv`` as annotations once loaded via
+    ``mne_bids.read_raw_bids``. We try the hardware channel first, then fall
+    back to annotations. Annotation descriptions come from the ``trial_type``/
+    ``value`` column and are arbitrary strings, so ``--stim-code`` (an int)
+    cannot select them directly -- use ``--trial-type`` instead. If neither is
+    given, we look for a description containing "laser" (this is a laser-pain
+    paradigm, so the stimulus onset event is very likely labelled that way);
+    failing that, we fall back to the single most frequent code so the script
+    still produces *something*, with a loud warning either way.
     """
     events = None
     # Path A: hardware stim channel (typical for .bdf).
@@ -256,10 +314,11 @@ def get_events(raw, stim_code: int | None):
     except (ValueError, RuntimeError):
         events = None
 
-    # Path B: annotations -> events.
+    # Path B: annotations -> events (this is where BIDS events.tsv rows land).
+    event_id_map = None
     if events is None or len(events) == 0:
         try:
-            events, _ = mne.events_from_annotations(raw, verbose="ERROR")
+            events, event_id_map = mne.events_from_annotations(raw, verbose="ERROR")
         except (ValueError, RuntimeError):
             events = np.empty((0, 3), dtype=int)
 
@@ -267,15 +326,36 @@ def get_events(raw, stim_code: int | None):
         return events, None
 
     present_codes = np.unique(events[:, 2])
-    chosen = stim_code
-    if chosen is None or chosen not in present_codes:
-        # Fall back to the most common event code.
+    chosen = stim_code if stim_code in present_codes else None
+
+    if chosen is None and event_id_map is not None:
+        if trial_type is not None:
+            matches = [c for desc, c in event_id_map.items()
+                       if desc == trial_type or trial_type.lower() in desc.lower()]
+            if matches:
+                chosen = matches[0]
+            else:
+                print(f"    [warn] --trial-type {trial_type!r} not found in "
+                      f"event descriptions: {list(event_id_map)}")
+        if chosen is None:
+            laser_matches = [c for desc, c in event_id_map.items()
+                              if "laser" in desc.lower()]
+            if laser_matches:
+                chosen = laser_matches[0]
+
+    if chosen is None:
+        # Last resort: the single most frequent code, whatever it is.
         codes, counts = np.unique(events[:, 2], return_counts=True)
         chosen = int(codes[np.argmax(counts)])
-        print(
-            f"    [warn] stim code {stim_code} not found; using most frequent "
-            f"code {chosen} (present codes: {present_codes.tolist()})"
-        )
+        desc = ""
+        if event_id_map is not None:
+            inv = {v: k for k, v in event_id_map.items()}
+            desc = f" ({inv.get(chosen, '?')!r})"
+        print(f"    [warn] no --stim-code/--trial-type match; using most "
+              f"frequent code {chosen}{desc}.")
+        if event_id_map is not None:
+            print(f"    [info] available trial types: {event_id_map}")
+
     return events, chosen
 
 
@@ -300,14 +380,15 @@ class SubjectResult:
         return float(np.mean(vals)) if vals else float("nan")
 
 
-def process_subject(sub: str, path: str, stim_code: int | None) -> SubjectResult | None:
+def process_subject(sub: str, path: str, bids_root: str, stim_code: int | None,
+                     trial_type: str | None) -> SubjectResult | None:
     """Compute mean pain vs baseline compression ratios for one subject."""
     result = SubjectResult(subject=sub)
     print(f"[{sub}] loading {os.path.basename(path)}")
-    raw = load_raw(path)
+    raw = load_raw(path, bids_root)
     pick_posterior_channels(raw)
 
-    events, code = get_events(raw, stim_code)
+    events, code = get_events(raw, stim_code, trial_type)
     if code is None:
         print(f"    [warn] no events found for {sub}; skipping.")
         return None
@@ -350,7 +431,8 @@ def process_subject(sub: str, path: str, stim_code: int | None) -> SubjectResult
 # Main
 # ---------------------------------------------------------------------------
 
-def run(bids_root: str, stim_code: int | None, limit: int | None) -> None:
+def run(bids_root: str, stim_code: int | None, trial_type: str | None,
+        limit: int | None) -> None:
     files = find_subject_files(bids_root)
     if not files:
         sys.exit(f"No raw EEG files found under {bids_root!r}. "
@@ -362,7 +444,7 @@ def run(bids_root: str, stim_code: int | None, limit: int | None) -> None:
     results: list[SubjectResult] = []
     for sub, path in files:
         try:
-            res = process_subject(sub, path, stim_code)
+            res = process_subject(sub, path, bids_root, stim_code, trial_type)
         except Exception as exc:  # keep going; one bad file shouldn't kill the run
             print(f"    [error] {sub}: {exc}")
             continue
@@ -417,9 +499,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--bids-root", required=True,
                    help="Path to the ds005284 BIDS root directory.")
     p.add_argument("--stim-code", type=int, default=None,
-                   help="Trigger code for the laser stimulus. If omitted or "
-                        "absent from the data, the most frequent event code is "
-                        "used (with a warning). INSPECT YOUR EVENTS FIRST.")
+                   help="Trigger code for the laser stimulus, if it comes from "
+                        "a hardware stim channel rather than events.tsv.")
+    p.add_argument("--trial-type", default=None,
+                   help="events.tsv trial_type/value string identifying the "
+                        "laser stimulus onset (e.g. 'laser_high'). If omitted, "
+                        "the script looks for a description containing "
+                        "'laser', then falls back to the most frequent event. "
+                        "INSPECT YOUR EVENTS FIRST -- run once and read the "
+                        "'available trial types' output before trusting results.")
     p.add_argument("--limit", type=int, default=None,
                    help="Process only the first N recordings (for quick testing).")
     return p
@@ -427,4 +515,4 @@ def build_parser() -> argparse.ArgumentParser:
 
 if __name__ == "__main__":
     args = build_parser().parse_args()
-    run(args.bids_root, args.stim_code, args.limit)
+    run(args.bids_root, args.stim_code, args.trial_type, args.limit)
