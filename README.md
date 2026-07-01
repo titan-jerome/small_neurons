@@ -29,9 +29,12 @@ Pain Dataset* — by:
 ```bash
 pip install -r requirements.txt
 
-# Download ds005284 from OpenNeuro first (e.g. via `openneuro-py` or datalad),
-# then point the script at its BIDS root:
-python compressibility_hypothesis.py --bids-root /path/to/ds005284
+# 1. Download ds005284 from OpenNeuro (public S3 bucket, no credentials needed).
+#    Full dataset is ~tens of GB; use --subjects to grab just a couple for testing.
+python download_dataset.py --target-dir ./ds005284 --subjects 01 02
+
+# 2. Run the analysis against the downloaded BIDS root:
+python compressibility_hypothesis.py --bids-root ./ds005284
 
 # Options:
 #   --stim-code N   trigger code for the laser stimulus (inspect your events!)
