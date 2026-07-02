@@ -40,22 +40,24 @@ Caveats (read before believing any p-value this prints)
 
 Output
 ------
-Instead of dumping to the terminal, the script writes a self-contained Markdown
-report (default: ``compressibility_report.md``, override with ``--report``)
+Instead of dumping to the terminal, the script writes a self-contained report
 covering the assumptions, the preprocessing pipeline, per-recording provenance
 (channels, events, trials), the per-subject compression ratios, and the paired
-t-test with a verdict. The terminal only shows brief progress + the report path.
+t-test with a verdict. By default it writes a Word document
+(``compressibility_report.docx``, via python-docx); pass ``--report name.md``
+for Markdown instead. The terminal only shows brief progress + the report path.
 
 Usage
 -----
     python compressibility_hypothesis.py --bids-root /path/to/ds005284
-    python compressibility_hypothesis.py --bids-root ./ds005284 --report run1.md
+    python compressibility_hypothesis.py --bids-root ./ds005284 --report run1.docx
 
 This dataset stores triggers in BIDS ``*_events.tsv`` sidecars rather than a
 raw stim channel, so ``mne-bids`` is required (not optional) to read them.
 
-Dependencies: mne, mne-bids, numpy, scipy. Install with:
-    pip install mne mne-bids numpy scipy
+Dependencies: mne, mne-bids, numpy, scipy, python-docx (for .docx output).
+Install with:
+    pip install mne mne-bids numpy scipy python-docx
 """
 
 from __future__ import annotations
@@ -698,6 +700,205 @@ def build_report(all_results: list[SubjectResult], config: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Word (.docx) report -- same content, native Word headings and tables
+# ---------------------------------------------------------------------------
+
+def _docx_table(doc, headers: list[str], rows: list[list[str]]):
+    """Add a styled Word table with a bold header row."""
+    table = doc.add_table(rows=1, cols=len(headers))
+    try:
+        table.style = "Light Grid Accent 1"   # a built-in Word table style
+    except KeyError:
+        table.style = "Table Grid"
+    for cell, text in zip(table.rows[0].cells, headers):
+        run = cell.paragraphs[0].add_run(text)
+        run.bold = True
+    for row in rows:
+        cells = table.add_row().cells
+        for cell, text in zip(cells, row):
+            cell.text = "" if text is None else str(text)
+    doc.add_paragraph()  # spacing after the table
+    return table
+
+
+def write_docx(all_results: list[SubjectResult], config: dict, path: str) -> None:
+    """Render the report as a real Word document via python-docx.
+
+    Raises ImportError if python-docx is not installed, so the caller can fall
+    back to Markdown.
+    """
+    from docx import Document
+    from docx.shared import Pt, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    usable = [r for r in all_results if r.usable]
+    skipped = [r for r in all_results if not r.usable]
+    doc = Document()
+
+    def note(text: str, italic: bool = True):
+        """A slightly greyed, italic caption-style paragraph."""
+        p = doc.add_paragraph()
+        run = p.add_run(text)
+        run.italic = italic
+        run.font.size = Pt(9)
+        run.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
+        return p
+
+    # Title block ----------------------------------------------------------
+    title = doc.add_heading("Algorithmic Compressibility of Pain vs. Baseline EEG", level=0)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    sub = doc.add_paragraph()
+    sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    sub.add_run(f"Generated {config['timestamp']}").italic = True
+
+    doc.add_paragraph(
+        "Test of the algorithmic compressibility corollary of the Symmetry Theory "
+        "of Valence: negative-valence states (acute laser pain) are predicted to "
+        "be less compressible (more algorithmically random) than matched "
+        "calm/baseline states. Operationalised by gzip/bz2 compression of short "
+        "posterior-EEG windows.")
+    p = doc.add_paragraph()
+    p.add_run("Directional hypothesis (H1): ").bold = True
+    p.add_run("compression_ratio(baseline) < compression_ratio(pain) "
+              "(baseline carries more redundancy). Lower ratio = more compressible.")
+
+    # 1. Assumptions -------------------------------------------------------
+    doc.add_heading("1. Assumptions & configuration", level=1)
+    _docx_table(doc, ["Parameter", "Value", "Rationale"], [
+        ["Dataset (BIDS root)", config["bids_root"], "OpenNeuro ds005284"],
+        ["Posterior channels targeted", ", ".join(POSTERIOR_CHANNELS),
+         "occipital/parietal only, to keep frontal EMG (jaw clench) & EOG "
+         "(blinks) out of the compression score"],
+        ["Pain window", f"{PAIN_TMIN:.1f} to {PAIN_TMAX:.1f} s post-stimulus",
+         "laser-evoked response"],
+        ["Baseline window", f"{BASE_TMIN:.1f} to {BASE_TMAX:.1f} s",
+         "matched-length rest, ending 1 s pre-stimulus to avoid anticipation"],
+        ["Stimulus event", config["trial_type"] or "auto-detect",
+         "the laser trials; other labels (e.g. the condition 64 onset-glitch "
+         "burst) are excluded"],
+        ["Serialisation", f"microvolts, {DECIMALS} decimals, space-separated ASCII",
+         "fixed-precision text exposes signal redundancy identically across "
+         "platforms (see matrix_to_bytes)"],
+        ["Compressors", "gzip -9, bz2 -9", "general-purpose lossless"],
+        ["Baseline correction", "none", "raw signal fed to compressor"],
+        ["Artefact rejection", "none",
+         "posterior-channel restriction is the only artefact control"],
+        ["Statistic", "one-sided paired t-test (scipy.stats.ttest_rel)",
+         "within-subject pain vs. baseline"],
+    ])
+    p = doc.add_paragraph()
+    p.add_run("Key caveat: ").bold = True
+    p.add_run("compression ratio of raw float EEG is driven largely by "
+              "amplitude/variance and the byte encoding, not purely by "
+              "\"algorithmic symmetry\". Larger evoked potentials can look less "
+              "compressible for reasons unrelated to valence. Treat this as a "
+              "falsifiable toy probe, not a validation of STV.")
+    p = doc.add_paragraph()
+    p.add_run("Channel-mapping caveat: ").bold = True
+    p.add_run("BioSemi hardware labels (A1…B32) are renamed to 10-20 names using "
+              "the standard published cap layout; if ds005284 used a non-standard "
+              "montage the posterior selection could be off. Confirm against "
+              "*_electrodes.tsv if in doubt.")
+
+    # 2. Pipeline ----------------------------------------------------------
+    doc.add_heading("2. Preprocessing pipeline (per recording)", level=1)
+    for step in [
+        "Load raw .bdf via mne_bids.read_raw_bids, which attaches the "
+        "*_events.tsv sidecar as annotations.",
+        "Rename BioSemi hardware channels to 10-20 names.",
+        "Pick the posterior channels present.",
+        "Locate events and select the laser-stimulus trigger.",
+        "Epoch each trigger into the pain and baseline windows (baseline=None, "
+        "no rejection), cropped to identical sample counts.",
+        "Serialise each (channels x time) window to bytes and record gzip & bz2 "
+        "compression ratios; average within subject.",
+    ]:
+        doc.add_paragraph(step, style="List Number")
+
+    # 3. Provenance --------------------------------------------------------
+    doc.add_heading("3. Per-recording processing", level=1)
+    doc.add_paragraph(
+        f"Recordings found: {len(all_results)}  |  usable: {len(usable)}  |  "
+        f"skipped: {len(skipped)}")
+    prov_rows = []
+    for r in all_results:
+        chans = ", ".join(r.channels_used) if r.channels_used else "-"
+        label = f"{r.event_label} ({r.event_code})" if r.event_code is not None else "-"
+        win = f"{r.n_samples} ({_fmt(r.window_sec, 3)} s)" if r.n_samples else "-"
+        prov_rows.append([
+            r.subject, r.filename,
+            _fmt(r.sfreq, 0) if not np.isnan(r.sfreq) else "-", chans,
+            r.cap_mapping or "-", label, r.event_method or "-",
+            f"{r.n_stim_events}/{r.n_other_events}", r.n_trials or "-", win])
+    _docx_table(doc, ["Subject", "File", "fs (Hz)", "Channels used", "Cap mapping",
+                      "Stim event (code)", "Selection", "Stim/other", "Trials",
+                      "Samples/window"], prov_rows)
+    if skipped:
+        doc.add_paragraph("Skipped recordings:").runs[0].bold = True
+        for r in skipped:
+            extra = (f"  (available events: {r.available_events})"
+                     if r.available_events else "")
+            doc.add_paragraph(f"{r.subject} - {r.status}{extra}", style="List Bullet")
+
+    # 4. Ratios ------------------------------------------------------------
+    doc.add_heading("4. Per-subject mean compression ratios", level=1)
+    note("Lower = more compressible (more redundancy). Each value is the mean "
+         "over that subject's trials.")
+    ratio_rows = []
+    for r in usable:
+        gp, gb = r.mean("pain", "gzip"), r.mean("base", "gzip")
+        bp, bb = r.mean("pain", "bz2"), r.mean("base", "bz2")
+        ratio_rows.append([r.subject, r.n_trials, _fmt(gp), _fmt(gb),
+                           _fmt(gp - gb), _fmt(bp), _fmt(bb), _fmt(bp - bb)])
+    _docx_table(doc, ["Subject", "Trials", "gzip pain", "gzip base",
+                      "delta (pain-base)", "bz2 pain", "bz2 base",
+                      "delta (pain-base)"], ratio_rows)
+    doc.add_paragraph(
+        "A positive delta (pain - baseline > 0) means the pain window was less "
+        "compressible than baseline - the direction H1 predicts.")
+
+    # 5. Statistics --------------------------------------------------------
+    doc.add_heading("5. Statistical comparison", level=1)
+    if len(usable) < 2:
+        note(f"Only {len(usable)} usable subject(s) - a paired t-test needs at "
+             "least 2, and is meaningless below a handful. No test run.", italic=False)
+    else:
+        doc.add_paragraph("Paired t-test on per-subject mean ratios, "
+                          "H1: baseline more compressible than pain.")
+        stat_rows, verdicts = [], []
+        for algo in ("gzip", "bz2"):
+            s = paired_test(usable, algo)
+            verdicts.append(s)
+            stat_rows.append([algo, s["n"], _fmt(s["mean_base"]), _fmt(s["mean_pain"]),
+                              _fmt(s["t"], 3), _fmt(s["p_one"], 4),
+                              "yes" if s["supported"] else "no"])
+        _docx_table(doc, ["Compressor", "n", "mean baseline", "mean pain", "t",
+                          "one-sided p", "Supports H1?"], stat_rows)
+        doc.add_heading("Verdict", level=2)
+        if all(v["supported"] for v in verdicts):
+            verdict = ("Baseline windows were significantly more compressible than "
+                       "pain windows on both compressors - consistent with the "
+                       "algorithmic compressibility hypothesis in this sample.")
+        elif any(v["supported"] for v in verdicts):
+            verdict = ("Mixed: significant in the predicted direction on one "
+                       "compressor but not the other. Weak/ambiguous support.")
+        else:
+            verdict = ("No significant support for the hypothesis in this sample: "
+                       "baseline windows were not reliably more compressible than "
+                       "pain windows.")
+        doc.add_paragraph(verdict)
+        n = len(usable)
+        if n < 10:
+            note(f"Warning: with only n = {n} subjects this test has very low "
+                 "power; treat any p-value (significant or not) as indicative "
+                 "only. Run the full cohort before drawing conclusions.", italic=False)
+
+    doc.add_paragraph()
+    note(f"Command: {config['argv']}")
+    doc.save(path)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -729,9 +930,22 @@ def run(bids_root: str, stim_code: int | None, trial_type: str | None,
         "trial_type": trial_type,
         "argv": " ".join(sys.argv),
     }
-    report = build_report(all_results, config)
-    with open(report_path, "w", encoding="utf-8") as fh:
-        fh.write(report)
+
+    # Choose the output format from the file extension. .docx -> Word document
+    # (needs python-docx); anything else -> Markdown. If python-docx is missing
+    # we fall back to a .md next to the requested path rather than crashing.
+    if report_path.lower().endswith(".docx"):
+        try:
+            write_docx(all_results, config, report_path)
+        except ImportError:
+            report_path = os.path.splitext(report_path)[0] + ".md"
+            print("    [warn] python-docx not installed; writing Markdown instead. "
+                  "Install it with: pip install python-docx")
+            with open(report_path, "w", encoding="utf-8") as fh:
+                fh.write(build_report(all_results, config))
+    else:
+        with open(report_path, "w", encoding="utf-8") as fh:
+            fh.write(build_report(all_results, config))
 
     usable = [r for r in all_results if r.usable]
     print(f"\nDone: {len(usable)}/{len(all_results)} recordings usable.")
@@ -753,9 +967,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "artifact burst and is deliberately excluded). Pass a "
                         "different string for other datasets, or '' to auto-"
                         "detect (looks for 'laser', else the most frequent code).")
-    p.add_argument("--report", default="compressibility_report.md",
-                   help="Path for the Markdown report (default: "
-                        "compressibility_report.md).")
+    p.add_argument("--report", default="compressibility_report.docx",
+                   help="Path for the report. A .docx extension writes a Word "
+                        "document (needs python-docx); any other extension (e.g. "
+                        ".md) writes Markdown. Default: "
+                        "compressibility_report.docx.")
     p.add_argument("--limit", type=int, default=None,
                    help="Process only the first N recordings (for quick testing).")
     return p
